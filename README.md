@@ -174,6 +174,15 @@ subscription handles the rest; no per-talkgroup server config is needed.
 - No announcements, no ID lookups, no database, no dashboard. It records and it
   replays.
 
+**If you hear nothing but the logs look perfect**, check the radio before the
+software. Manual-dialing a talkgroup sets what you transmit to, but the
+channel's **RX group list** is what decides whether the radio unmutes on
+receive — so the call goes out, the echo comes back on the same talkgroup, and
+the radio stays silent. Put the talkback's talkgroup in the RX group list, or
+use a channel that already has it. A talkback call that reached the server logs
+`*GROUP CALL START*` twice: once from your radio ID, then again ~2 s later from
+the talkback's ID. If you see both, everything upstream of the radio is working.
+
 ## Companions
 
 - [HBlink3](https://github.com/n0mjs710/hblink3) — DMR transit router / conference bridge
