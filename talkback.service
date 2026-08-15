@@ -1,0 +1,22 @@
+# talkback.service — systemd unit for dmr-talkback.
+# Installed by `sudo make install` to /lib/systemd/system/talkback.service.
+
+[Unit]
+Description=DMR voice test (talkback) endpoint
+Documentation=https://github.com/n0mjs710/dmr-talkback
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/talkback -c /etc/talkback/talkback.toml
+Restart=on-failure
+RestartSec=10s
+TimeoutStopSec=10s
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=talkback
+
+[Install]
+WantedBy=multi-user.target

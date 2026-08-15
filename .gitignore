@@ -1,0 +1,18 @@
+# Live configuration — never commit; copy talkback.toml.sample to get started
+talkback.toml
+
+# Build artifacts
+*.o
+*.a
+/talkback
+
+# Claude Code session files
+.claude/
+
+# Editor / OS
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/

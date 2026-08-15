@@ -1,0 +1,79 @@
+# talkback.toml — configuration for dmr-talkback
+#
+# Copy this file to talkback.toml (or /etc/talkback/talkback.toml) and edit for
+# your deployment.  The live config is gitignored — it holds your passphrase.
+
+[global]
+# Logging verbosity: "DEBUG" | "INFO" | "WARNING" | "ERROR"
+# DEBUG logs every frame decision and is very noisy.  INFO gives you one line
+# each for capture start, capture end, replay start, and replay end.
+log_level = "INFO"
+
+
+[talkback]
+# The radio ID.  There is only one, and it performs every radio-ID function:
+#
+#   * the HBP login ID (what you register with the master)
+#   * the DMRD repeater ID on every packet we transmit
+#   * the source radio ID of the replayed call
+#   * the ID users make a private call TO in order to reach the talkback
+#
+# Use a real, registered ID.  Masters that check the DMRD repeater field
+# against the logged-in repeater ID will accept our traffic because they are
+# the same value.
+radio_id = 3120099
+
+# Which call types are answered: "GROUP" | "UNIT" | "BOTH"
+#
+# The reply always mirrors what came in.  A group call is replayed onto the
+# same talkgroup, so everyone listening hears it.  A private call to our radio
+# ID is answered with a private call back to whoever placed it.  Both replies
+# are sourced from radio_id above.
+#
+# The public networks disagree on this — BrandMeister uses a private call,
+# DMR+ uses a group call — so users show up with both habits.  "BOTH" is the
+# friendly default.
+mode = "BOTH"
+
+# Talkgroups to listen and reply on, per timeslot.  Group mode only.
+#
+# These also become the RPTO subscription string sent at login
+# (TS1=...;TS2=...).  That matters: HBlink4 will not send a talkgroup to a
+# repeater that has not subscribed to it, so without this the talkback would
+# connect and then hear nothing.  HBlink3 ignores the subscription harmlessly.
+group_ts1_tgids = []
+group_ts2_tgids = [9990]
+
+# Timeslots on which a private call to radio_id is accepted.  Unit mode only.
+# The reply goes back out on the slot the call arrived on.  Talkgroups are not
+# involved in unit calls at all.
+unit_slots = [1, 2]
+
+# How long to wait after the caller unkeys before replaying, in milliseconds.
+# Two seconds is long enough that the caller has certainly let go of the PTT.
+replay_delay_ms = 2000
+
+# Longest call we will record, in seconds.  This sizes the capture buffer at
+# startup (one 55-byte packet per 60 ms), and it is a hard ceiling: a longer
+# transmission is replayed up to this point rather than discarded.
+max_capture_secs = 30
+
+
+[master]
+# The HBP master to connect to.  Keep this on loopback if the master is on the
+# same box — then the passphrase never touches the network.
+ip         = "127.0.0.1"
+port       = 54000
+passphrase = "s3cr37w0rd"
+
+
+[announce]
+# Cosmetic.  There is no radio behind this connection; these fields exist only
+# to fill the 302-byte RPTC config blob the protocol requires, and they are
+# what dashboards will display.  Frequencies, power, and location are fixed at
+# inert values in the code.
+callsign    = "TALKBACK"
+description = "Voice Test"
+location    = ""
+url         = ""
+colorcode   = "01"
