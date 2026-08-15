@@ -138,9 +138,29 @@ Where talkback runs on the same server as HBlink3/4, and those programs listen
 on the loopback, connect to the loopback — it avoids extra overhead on the live
 network port and keeps the passphrase off the wire.
 
-**HBlink3** — add a `MODE: SERVER` system for each instance to log into. With one
-instance per system you need no bridge at all; if you'd rather have one shared
-talkback, bridge its talkgroup in `rules.py` instead.
+**HBlink3** — point each instance at an **existing** `MODE: SERVER` system: its
+`IP`, `PORT`, and `PASSPHRASE`. You don't create a system for the talkback unless
+your intention is to have one that other systems bridge to on a specific TS/TGID.
+It logs in as one more client of a system your repeaters already use, which is
+what makes the service direct and unbridged.
+
+Nothing else is needed, because a Server with `REPEAT: True` (the normal setting)
+repeats every stream to its connected clients except the one it came from. A
+repeater keys the talkback's talkgroup and the talkback hears it; the talkback
+replays and every other client on that system hears it. That same
+except-the-source rule is what keeps the replay from coming back into the
+talkback. No bridge, no rules.
+
+Check on the system you're joining:
+
+- `REG_ACL` permits the talkback's radio ID to register
+- `SUB_ACL` permits that ID as a source — it is the source of every replay
+- `TGID_TS1_ACL` / `TGID_TS2_ACL` permit the talkback's talkgroup on its slot
+- it consumes one of that system's `MAX_REPEATERS`
+
+To cover several systems, run one instance per system. Bridging the talkback's
+talkgroup in `rules.py` is only for the different case where you deliberately
+want one talkback shared across systems.
 
 **HBlink4** — add an access-control entry for the radio ID. The `Options=`
 subscription handles the rest; no per-talkgroup server config is needed.

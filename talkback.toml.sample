@@ -22,9 +22,14 @@ log_level = "INFO"
 # An HBlink3 server hosts several independent "systems".  Normally, giving all
 # of them a talkback means building a bridge that multiplexes every system into
 # one talkback engine — bridge rules to write, and one shared talkback that all
-# systems contend for.  Instead, run one instance per system.  Each system gets
-# its own private talkback on its own TGID, no bridge required, and no system
-# can tie up another system's talkback.
+# systems contend for.
+#
+# Instead, run one instance per system.  Each instance logs into an EXISTING
+# system, as one more client alongside that system's repeaters — you do not
+# create systems for talkback.  A Server with REPEAT: True (the normal setting)
+# repeats traffic among its clients, so that alone is the whole integration.
+# Each system gets its own private talkback on its own TGID, no bridge required,
+# and no system can tie up another's.
 #
 # Bridging everyone into a single instance is still perfectly valid if that is
 # what you want — one talkback heard across several systems.  Both work; pick
@@ -71,8 +76,13 @@ radio_id = 3120099
 slot1_tgid = 0
 slot2_tgid = 9990
 
-# The server this instance connects to.  Keep it on loopback where the server
-# runs on the same box — then the passphrase never touches the network.
+# What this instance connects to: the IP, PORT and PASSPHRASE of an EXISTING
+# HBlink3 system, or of an HBlink4 server.  Keep it on loopback where that runs
+# on the same box — then the passphrase never touches the network.
+#
+# On HBlink3, also confirm that system's ACLs let the talkback in: REG_ACL for
+# registration, SUB_ACL for the radio ID above (it is the source of every
+# replay), and the TGID ACL for the slot talkgroups below.
 master_ip   = "127.0.0.1"
 master_port = 54000
 passphrase  = "s3cr37w0rd"
