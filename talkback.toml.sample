@@ -46,10 +46,16 @@ log_level = "INFO"
 # NOTHING ROUTES TO IT.  Talkback answers group calls only, so this ID is never
 # a destination and never enters unit-call routing.  It therefore does NOT need
 # to be a globally unique registered ID per instance — one ID you already own
-# can serve every instance you run.  Give instances distinct IDs only if you
-# want them to show up separately in last-heard.
+# can serve every instance you run, including instances on different systems of
+# the same HBlink3 server.  Give instances distinct IDs only if you want them to
+# show up separately in last-heard.
 #
-# The one hard rule: two instances on the SAME server must not share an ID.
+# The one hard rule is per LISTENING SOCKET, not per host: two instances that
+# connect to the same ip:port must not share an ID.  That is a registration
+# constraint — an HBP server keys registered repeaters by radio ID and validates
+# the source address per packet, so two connections with one ID to one socket
+# fight over the same entry.  Each HBlink3 system has its own port, so this only
+# bites if you aim two instances at the same system.  Rejected at startup.
 radio_id = 3120099
 
 # The talkgroup this instance answers, per timeslot.  Omit or set 0 to leave a

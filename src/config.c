@@ -171,18 +171,27 @@ int config_load(const char *path, Config *cfg, char *err, size_t errlen)
         load_instance(t, &e, secs[i], &cfg->inst[i]);
     cfg->n_inst = n;
 
-    /* Two instances pointed at the same server with the same radio ID would be
-     * the same repeater logging in twice: the server drops one, or they fight
-     * over the registration.  Distinct servers with a shared ID is fine and
-     * expected — that is the whole point of group-only talkback. */
+    /* Two instances logging into the SAME listening socket with the same radio
+     * ID collide at the registration layer, not the routing layer: an HBP
+     * server keys its registered repeaters by radio ID and then validates the
+     * source address on every packet (hblink3 hblink.py:478+,
+     * `self._repeaters[_peer_id]` + the SOCKADDR check).  One dict entry, two
+     * clients — the second login takes it and the first's traffic is dropped.
+     *
+     * This is per socket, not per host.  Each HBlink3 *system* listens on its
+     * own port and has its own `_repeaters` dict, so several instances sharing
+     * one radio ID across several systems on one box is fine — and is the
+     * expected arrangement, since group-only talkback never has anything
+     * routed to its ID. */
     for (int i = 0; i < n; i++)
         for (int j = i + 1; j < n; j++) {
             const InstanceCfg *a = &cfg->inst[i], *b = &cfg->inst[j];
             if (a->radio_id == b->radio_id && a->master_port == b->master_port &&
                 !strcmp(a->master_ip, b->master_ip))
-                adderr(&e, "instances '%s' and '%s' share radio ID %u on the same "
-                           "server %s:%d — one of them must differ",
-                       a->name, b->name, a->radio_id, a->master_ip, a->master_port);
+                adderr(&e, "instances '%s' and '%s' both log into %s:%d with radio "
+                           "ID %u — one connection per radio ID per listening "
+                           "socket; give one of them a different ID",
+                       a->name, b->name, a->master_ip, a->master_port, a->radio_id);
         }
 
     toml_free(t);

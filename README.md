@@ -73,13 +73,10 @@ version.
 
 ### Running more than one instance
 
-An HBlink3 server hosts several independent **systems**. Normally, giving all of
+An HBlink3 server hosts several independent **systems**. Previously, giving all of
 them a talkback means building a bridge that multiplexes every system into one
 talkback engine — bridge rules to write, and one shared talkback that every
 system contends for.
-
-Instead, run one instance per system. Each system gets its own private talkback
-on its own TGID, no bridge required, and no system can tie up another's:
 
 ```toml
 [instance.lawrence]
@@ -104,12 +101,21 @@ Two things to know:
 - **Don't point one process at several different HBlink3 servers.** Instances
   are independent so it would function, but you've made one process a single
   point of failure for several servers and interleaved the logs of unrelated
-  networks. Run a process per server.
+  networks. Runing a process per server is must cleaner.
 - **HBlink4 has no "system" concept** — the server is the unit. One instance per
   HBlink4 server is the only arrangement that makes sense.
 
-Instances may share a radio ID across *different* servers. Two instances on the
-*same* server may not, and that's rejected at startup.
+**Sharing one radio ID across instances is fine**, and is the normal
+arrangement — group-only talkback never has anything routed to its ID, so it
+carries no addressing meaning. Six instances on six HBlink3 systems can all use
+the same ID.
+
+The single exception is per *listening socket*, and it is a registration
+constraint rather than a routing one: an HBP server keys its registered
+repeaters by radio ID and then validates the source address on every packet, so
+two connections to the **same `ip:port`** with the same ID share one entry and
+fight over it. Each HBlink3 system listens on its own port, so this only bites
+if you point two instances at the same system. It's rejected at startup.
 
 ## Build and install
 
