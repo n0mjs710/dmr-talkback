@@ -1,47 +1,43 @@
-/* config.h — parsed, validated configuration. */
+/* config.h — parsed, validated configuration.
+ *
+ * One process runs N independent talkback instances.  Each instance is one
+ * HBP connection to one server, with its own radio ID and its own talkgroups.
+ * Instances share nothing but the event loop.
+ */
 #ifndef CONFIG_H
 #define CONFIG_H
 
 #include <stdint.h>
 #include <stddef.h>
 
-#define CFG_MAX_TGIDS 32
-
-enum { MODE_GROUP = 1, MODE_UNIT = 2, MODE_BOTH = 3 };
+#define CFG_MAX_INSTANCES 16
 
 typedef struct {
-    int      log_level;             /* LOG_* enum */
+    char     name[64];              /* the [instance.<name>] label, for logging */
 
-    /* [talkback] */
-    uint32_t radio_id;              /* THE radio ID: HBP login, DMRD repeater,
-                                     * DMRD source of the replay, and the unit
-                                     * call target.  One ID, every role. */
-    int      mode;                  /* MODE_GROUP | MODE_UNIT | MODE_BOTH */
+    /* The radio ID.  Source of every stream this instance originates and its
+     * HBP login ID.  Nothing routes *to* it — talkback answers group calls
+     * only, so this never needs to be a globally unique registered ID. */
+    uint32_t radio_id;
+
+    /* One talkgroup per slot; 0 means the slot is unused.  One TGID per slot
+     * is deliberate: a slot carries one call at a time, so a list would
+     * advertise capacity that does not exist. */
+    uint32_t slot1_tgid;
+    uint32_t slot2_tgid;
+
     double   replay_delay;          /* seconds after capture end */
-    int      max_capture_secs;      /* bounds the fixed capture buffer */
+    int      max_capture_secs;      /* bounds each lane's fixed buffer */
 
-    /* Group talkgroups we listen and reply on, per slot.  Also drives the
-     * RPTO options string (see hbp.c), which is what makes this work on
-     * HBlink4 without server-side configuration. */
-    uint32_t group_ts1[CFG_MAX_TGIDS];
-    int      n_group_ts1;
-    uint32_t group_ts2[CFG_MAX_TGIDS];
-    int      n_group_ts2;
-
-    /* Slots on which a private call to radio_id is accepted. */
-    int      unit_slot1;
-    int      unit_slot2;
-
-    /* [master] */
+    /* server */
     char     master_ip[256];
     int      master_port;
     char     passphrase[256];
     int      passphrase_len;
 
-    /* RPTC announcement fields.  There is no radio; these exist only to fill
-     * the 302-byte config blob.  Only callsign/description/location are worth
-     * configuring. */
-    char     options[512];          /* generated, not read from file */
+    /* RPTC announcement fields.  There is no radio; most are inert constants.
+     * `options` is generated from the slot talkgroups, not read from file. */
+    char     options[512];
     char     callsign[64];
     char     rx_freq[32];
     char     tx_freq[32];
@@ -55,20 +51,22 @@ typedef struct {
     char     url[256];
     char     software_id[64];
     char     package_id[64];
+} InstanceCfg;
+
+typedef struct {
+    int         log_level;          /* LOG_* enum */
+    InstanceCfg inst[CFG_MAX_INSTANCES];
+    int         n_inst;
 } Config;
 
 /* Load and validate a TOML config file.  Returns 0 on success; on failure
  * returns -1 and fills err with a human-readable message. */
 int config_load(const char *path, Config *cfg, char *err, size_t errlen);
 
-/* True if the configured mode answers group / unit calls. */
-static inline int cfg_does_group(const Config *c) { return (c->mode & MODE_GROUP) != 0; }
-static inline int cfg_does_unit (const Config *c) { return (c->mode & MODE_UNIT)  != 0; }
-
-/* True if tgid is in the listen list for slot (1 or 2). */
-int cfg_group_match(const Config *cfg, int slot, uint32_t tgid);
-
-/* True if a private call arriving on slot is accepted. */
-int cfg_unit_slot_ok(const Config *cfg, int slot);
+/* The talkgroup an instance answers on `slot` (1 or 2); 0 if that slot is
+ * unused. */
+static inline uint32_t cfg_slot_tgid(const InstanceCfg *ic, int slot) {
+    return (slot == 2) ? ic->slot2_tgid : ic->slot1_tgid;
+}
 
 #endif

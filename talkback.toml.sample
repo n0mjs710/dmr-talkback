@@ -1,79 +1,103 @@
 # talkback.toml — configuration for dmr-talkback
 #
 # Copy this file to talkback.toml (or /etc/talkback/talkback.toml) and edit for
-# your deployment.  The live config is gitignored — it holds your passphrase.
+# your deployment.  The live config is gitignored — it holds your passphrases.
 
 [global]
 # Logging verbosity: "DEBUG" | "INFO" | "WARNING" | "ERROR"
-# DEBUG logs every frame decision and is very noisy.  INFO gives you one line
-# each for capture start, capture end, replay start, and replay end.
+# DEBUG logs every gate decision and is noisy.  INFO gives you one line each
+# for capture start, capture end, replay start, and replay end, per slot.
 log_level = "INFO"
 
 
-[talkback]
-# The radio ID.  There is only one, and it performs every radio-ID function:
+# ---------------------------------------------------------------------------
+# Instances
+# ---------------------------------------------------------------------------
 #
-#   * the HBP login ID (what you register with the master)
-#   * the DMRD repeater ID on every packet we transmit
-#   * the source radio ID of the replayed call
-#   * the ID users make a private call TO in order to reach the talkback
+# Each [instance.<name>] is one connection to one server, with its own radio
+# ID and its own talkgroups.  The name is yours — it labels the log lines.
 #
-# Use a real, registered ID.  Masters that check the DMRD repeater field
-# against the logged-in repeater ID will accept our traffic because they are
-# the same value.
+# WHY MORE THAN ONE:
+#
+# An HBlink3 server hosts several independent "systems".  Normally, giving all
+# of them a talkback means building a bridge that multiplexes every system into
+# one talkback engine — bridge rules to write, and one shared talkback that all
+# systems contend for.  Instead, run one instance per system.  Each system gets
+# its own private talkback on its own TGID, no bridge required, and no system
+# can tie up another system's talkback.
+#
+# Bridging everyone into a single instance is still perfectly valid if that is
+# what you want — one talkback heard across several systems.  Both work; pick
+# the one that matches how you want it to behave.
+#
+# WHAT NOT TO DO: do not point one process at several *different* HBlink3
+# servers.  Instances are independent, so it would function, but you have then
+# made one process a single point of failure for several servers, and the logs
+# of unrelated networks end up interleaved.  Run a process per server.
+#
+# HBLINK4: HBlink4 has no "system" concept — the server is the unit.  One
+# instance per HBlink4 server is the only arrangement that makes sense.
+
+[instance.lawrence]
+
+# The radio ID.  This is the HBP login ID and the source radio ID of every
+# stream this instance transmits.
+#
+# NOTHING ROUTES TO IT.  Talkback answers group calls only, so this ID is never
+# a destination and never enters unit-call routing.  It therefore does NOT need
+# to be a globally unique registered ID per instance — one ID you already own
+# can serve every instance you run.  Give instances distinct IDs only if you
+# want them to show up separately in last-heard.
+#
+# The one hard rule: two instances on the SAME server must not share an ID.
 radio_id = 3120099
 
-# Which call types are answered: "GROUP" | "UNIT" | "BOTH"
+# The talkgroup this instance answers, per timeslot.  Omit or set 0 to leave a
+# slot unused.
 #
-# The reply always mirrors what came in.  A group call is replayed onto the
-# same talkgroup, so everyone listening hears it.  A private call to our radio
-# ID is answered with a private call back to whoever placed it.  Both replies
-# are sourced from radio_id above.
+# ONE TALKGROUP PER SLOT, deliberately.  A DMR timeslot carries one call at a
+# time, so a list of talkgroups on one slot would advertise capacity that does
+# not exist.  Two slots means exactly two callers can be served at once, and
+# the config says so plainly.
 #
-# The public networks disagree on this — BrandMeister uses a private call,
-# DMR+ uses a group call — so users show up with both habits.  "BOTH" is the
-# friendly default.
-mode = "BOTH"
+# The two slots are fully independent: a caller on TS1 and a caller on TS2 are
+# recorded and played back at the same time without interfering.
+slot1_tgid = 0
+slot2_tgid = 9990
 
-# Talkgroups to listen and reply on, per timeslot.  Group mode only.
-#
-# These also become the RPTO subscription string sent at login
-# (TS1=...;TS2=...).  That matters: HBlink4 will not send a talkgroup to a
-# repeater that has not subscribed to it, so without this the talkback would
-# connect and then hear nothing.  HBlink3 ignores the subscription harmlessly.
-group_ts1_tgids = []
-group_ts2_tgids = [9990]
-
-# Timeslots on which a private call to radio_id is accepted.  Unit mode only.
-# The reply goes back out on the slot the call arrived on.  Talkgroups are not
-# involved in unit calls at all.
-unit_slots = [1, 2]
+# The server this instance connects to.  Keep it on loopback where the server
+# runs on the same box — then the passphrase never touches the network.
+master_ip   = "127.0.0.1"
+master_port = 54000
+passphrase  = "s3cr37w0rd"
 
 # How long to wait after the caller unkeys before replaying, in milliseconds.
 # Two seconds is long enough that the caller has certainly let go of the PTT.
 replay_delay_ms = 2000
 
-# Longest call we will record, in seconds.  This sizes the capture buffer at
-# startup (one 55-byte packet per 60 ms), and it is a hard ceiling: a longer
-# transmission is replayed up to this point rather than discarded.
+# Longest call this instance will record, in seconds.  Sizes the capture buffer
+# for each active slot at startup (one 55-byte packet per 60 ms), and is a hard
+# ceiling: a longer transmission is replayed up to this point, not discarded.
 max_capture_secs = 30
 
-
-[master]
-# The HBP master to connect to.  Keep this on loopback if the master is on the
-# same box — then the passphrase never touches the network.
-ip         = "127.0.0.1"
-port       = 54000
-passphrase = "s3cr37w0rd"
-
-
-[announce]
-# Cosmetic.  There is no radio behind this connection; these fields exist only
-# to fill the 302-byte RPTC config blob the protocol requires, and they are
-# what dashboards will display.  Frequencies, power, and location are fixed at
-# inert values in the code.
+# Cosmetic.  There is no radio behind this connection; these fill the 302-byte
+# RPTC config blob the protocol requires, and they are what dashboards display.
+# Frequencies, power, and location are fixed at inert values in the code.
 callsign    = "TALKBACK"
 description = "Voice Test"
 location    = ""
 url         = ""
 colorcode   = "01"
+
+
+# A second system on the same HBlink3 server, with its own talkback TGID.
+# Same radio ID would collide here (same server), so this one differs.
+#
+# [instance.topeka]
+# radio_id    = 3120098
+# slot2_tgid  = 9991
+# master_ip   = "127.0.0.1"
+# master_port = 54010
+# passphrase  = "s3cr37w0rd"
+# callsign    = "TALKBACK"
+# description = "Voice Test"

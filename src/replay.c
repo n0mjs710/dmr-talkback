@@ -1,4 +1,4 @@
-/* replay.c — packet rewrite and clocked egress.
+/* replay.c — packet rewrite and clocked egress, per lane.
  *
  * Two jobs:
  *
@@ -8,9 +8,7 @@
  *     is what every earlier implementation of this program did, and it leaves
  *     the header and the payload disagreeing about who is calling: radios and
  *     MMDVMHost decode the payload LC for display and late entry, so the echo
- *     comes back showing the original caller.  For unit calls it is worse —
- *     the FLCO has to flip to unit-voice or the receiving radio treats the
- *     private reply as a group call.
+ *     comes back showing the original caller.
  *
  *     AMBE is never touched.  Only LC windows are replaced, so the audio that
  *     comes back is bit-identical to the audio that went in.
@@ -18,6 +16,9 @@
  *  2. Clock.  Packets go out one per 60 ms off the event loop.  Never a
  *     blocking sleep — that is what stalled the Python versions' reactor for
  *     the whole duration of the playback.
+ *
+ * Each lane clocks independently, so a replay on TS1 and a replay on TS2 run
+ * at the same time without interacting.
  */
 #include "talkback.h"
 #include "hbp.h"
@@ -34,30 +35,11 @@
 #define FULL_LC_BITS   196
 
 /* Bit windows inside the payload (see hblink4 hblink4/lc.py). */
-#define LC_LOW_START     0    /* [0:98]    first half of the 196-bit BPTC LC  */
-#define LC_LOW_END      98
+#define LC_LOW_END      98    /* [0:98]    first half of the 196-bit BPTC LC  */
 #define SYNC_START      98    /* [98:166]  slot type + sync — PRESERVED       */
-#define SYNC_END       166
 #define LC_HIGH_START  166    /* [166:264] second half of the BPTC LC         */
-#define LC_HIGH_END    264
 #define EMB_START      116    /* [116:148] 32-bit embedded-LC fragment        */
 #define EMB_END        148
-
-struct replay {
-    const Config *cfg;
-    ev_loop      *loop;
-    struct hbp  **hb_slot;      /* indirect: the hbp is created after us */
-
-    int        active;
-    int        idx;             /* next packet index to send */
-    int        n;               /* packets to send */
-    uint8_t   *pkts;            /* our own copy of the captured stream */
-    int        cap;             /* capacity in packets */
-    uint8_t    seq;             /* replay-relative DMRD sequence */
-    tb_rewrite rw;
-    ev_timer  *timer;
-    double     started;
-};
 
 static uint32_t rd24(const uint8_t *p) {
     return (uint32_t)p[0] << 16 | (uint32_t)p[1] << 8 | p[2];
@@ -66,7 +48,7 @@ static uint32_t rd24(const uint8_t *p) {
 /* ---------------- rewrite (pure; exercised directly by tests) ------------- */
 
 void tb_rewrite_init(tb_rewrite *rw, uint32_t radio_id, const uint8_t dst[3],
-                     int is_unit, uint32_t stream_id)
+                     uint32_t stream_id)
 {
     memset(rw, 0, sizeof *rw);
 
@@ -75,7 +57,7 @@ void tb_rewrite_init(tb_rewrite *rw, uint32_t radio_id, const uint8_t dst[3],
     rw->src[2] = (uint8_t)(radio_id);
     memcpy(rw->dst, dst, 3);
 
-    /* The DMRD repeater field is the same ID.  Masters that check it against
+    /* The DMRD repeater field is the same ID.  Servers that check it against
      * the logged-in repeater ID therefore accept the stream. */
     rw->rptr[0] = (uint8_t)(radio_id >> 24);
     rw->rptr[1] = (uint8_t)(radio_id >> 16);
@@ -83,12 +65,11 @@ void tb_rewrite_init(tb_rewrite *rw, uint32_t radio_id, const uint8_t dst[3],
     rw->rptr[3] = (uint8_t)(radio_id);
 
     rw->stream_id = stream_id;
-    rw->is_unit   = is_unit;
 
     /* The reply LC, built from scratch — nothing is carried over from the
-     * caller.  FLCO 0x00 group / 0x03 unit, FID 0, service options 0.
-     * (dmr_utils3 const.py LC_OPT_G / LC_OPT_U.) */
-    rw->lc[0] = is_unit ? 0x03 : 0x00;
+     * caller.  FLCO 0x00 group voice, FID 0, service options 0
+     * (dmr_utils3 const.py LC_OPT_G). */
+    rw->lc[0] = 0x00;
     rw->lc[1] = 0x00;
     rw->lc[2] = 0x00;
     memcpy(rw->lc + 3, rw->dst, 3);
@@ -116,12 +97,10 @@ void tb_rewrite_packet(const tb_rewrite *rw, const uint8_t *in, uint8_t *out, ui
     out[DMRD_STREAM_OFF + 3] = (uint8_t)(rw->stream_id);
 
     /* Slot bit, frame type and dtype/vseq are preserved — the replay is the
-     * same sequence of frame kinds as the capture.  Only the call-type bit
-     * changes, and only because the reply may differ from... nothing, in
-     * practice: the reply mirrors the inbound type.  Set it explicitly anyway
-     * so the header can never disagree with the FLCO we just built. */
-    if (rw->is_unit) out[DMRD_FLAGS_OFF] |=  HBPF_TGID_CALL_P;
-    else             out[DMRD_FLAGS_OFF] &= (uint8_t)~HBPF_TGID_CALL_P;
+     * same sequence of frame kinds, on the same slot, as the capture.  The
+     * call-type bit is forced clear: every reply is a group call, and the
+     * header must never disagree with the FLCO we just built. */
+    out[DMRD_FLAGS_OFF] &= (uint8_t)~HBPF_TGID_CALL_P;
 
     /* No radio, no receiver: these are ours to zero. */
     out[DMRD_BER_OFF]  = 0;
@@ -132,7 +111,7 @@ void tb_rewrite_packet(const tb_rewrite *rw, const uint8_t *in, uint8_t *out, ui
     int ftyp = flags & HBPF_FRAMETYPE_MASK;
     int dtyp = flags & HBPF_DTYPE_MASK;
 
-    const dmr_bit *full_lc = NULL;
+    const dmr_bit *full_lc  = NULL;
     const uint8_t *emb_frag = NULL;
 
     if (ftyp == HBPF_FRAMETYPE_DATASYNC) {
@@ -153,7 +132,7 @@ void tb_rewrite_packet(const tb_rewrite *rw, const uint8_t *in, uint8_t *out, ui
     if (full_lc) {
         /* [0:98] and [166:264] replaced; [98:166] (slot type + sync, which is
          * where the colour code lives) deliberately untouched. */
-        memcpy(bits + LC_LOW_START,  full_lc,      LC_LOW_END - LC_LOW_START);
+        memcpy(bits,                 full_lc,      LC_LOW_END);
         memcpy(bits + LC_HIGH_START, full_lc + 98, FULL_LC_BITS - 98);
     } else {
         dmr_bit fb[32];
@@ -168,101 +147,92 @@ void tb_rewrite_packet(const tb_rewrite *rw, const uint8_t *in, uint8_t *out, ui
 
 static void tick_cb(ev_loop *loop, void *ud);
 
-static void arm_tick(replay *rp, double delay) {
-    rp->timer = ev_timer_after(rp->loop, delay, tick_cb, rp);
-}
-
-static void finish(replay *rp) {
-    double dur = ev_now(rp->loop) - rp->started;
-    LOGI(LOGN, "replay end    — %d packets, %.1fs", rp->n, dur);
-    rp->active = 0;
-    rp->idx = 0;
-    rp->n = 0;
+static void finish(tb_lane *ln) {
+    LOGI(LOGN, "[%s] TS%d replay end    — %d packets, %.1fs",
+         instance_name(ln->inst), ln->slot, ln->rp.n,
+         ev_now(instance_loop(ln->inst)) - ln->rp.started);
+    ln->rp.active = 0;
+    ln->rp.idx = 0;
+    ln->rp.n = 0;
 }
 
 static void tick_cb(ev_loop *loop, void *ud) {
-    replay *rp = ud;
-    rp->timer = NULL;
-    if (!rp->active) return;
+    tb_lane *ln = ud;
+    ln->rp.timer = NULL;
+    if (!ln->rp.active) return;
 
-    struct hbp *hb = *rp->hb_slot;
+    struct hbp *hb = instance_hbp(ln->inst);
     if (!hb || !hbp_is_connected(hb)) {
-        LOGW(LOGN, "replay aborted — HBP link down");
-        finish(rp);
+        LOGW(LOGN, "[%s] TS%d replay aborted — link down", instance_name(ln->inst), ln->slot);
+        finish(ln);
         return;
     }
 
-    if (rp->idx == 0)
-        LOGI(LOGN, "replay start  — %s call to %u from %u, %d packets, stream %08x",
-             rp->rw.is_unit ? "unit" : "group", rd24(rp->rw.dst), rd24(rp->rw.src),
-             rp->n, rp->rw.stream_id);
-
     uint8_t out[DMRD_LEN];
-    tb_rewrite_packet(&rp->rw, rp->pkts + (size_t)rp->idx * DMRD_LEN, out, rp->seq++);
+    tb_rewrite_packet(&ln->rp.rw, ln->rp.pkts + (size_t)ln->rp.idx * DMRD_LEN,
+                      out, ln->rp.seq++);
     hbp_send_dmrd(hb, out, DMRD_LEN);
 
-    rp->idx++;
-    if (rp->idx >= rp->n) { finish(rp); return; }
-    arm_tick(rp, TB_FRAME_SECS);
-    (void)loop;
+    ln->rp.idx++;
+    if (ln->rp.idx >= ln->rp.n) { finish(ln); return; }
+    ln->rp.timer = ev_timer_after(loop, TB_FRAME_SECS, tick_cb, ln);
 }
 
 static void begin_cb(ev_loop *loop, void *ud) {
-    replay *rp = ud;
-    rp->timer = NULL;
-    rp->started = ev_now(loop);
-    rp->idx = 0;
-    rp->seq = 0;
-    tick_cb(loop, rp);
+    tb_lane *ln = ud;
+    ln->rp.timer = NULL;
+    ln->rp.started = ev_now(loop);
+    ln->rp.idx = 0;
+    ln->rp.seq = 0;
+    LOGI(LOGN, "[%s] TS%d replay start  — TG %u from %u, %d packets, stream %08x",
+         instance_name(ln->inst), ln->slot, rd24(ln->rp.rw.dst), rd24(ln->rp.rw.src),
+         ln->rp.n, ln->rp.rw.stream_id);
+    tick_cb(loop, ln);
 }
 
 /* ---------------- public API ---------------- */
 
-replay *replay_new(const Config *cfg, ev_loop *loop, struct hbp **hb_slot) {
-    replay *rp = calloc(1, sizeof *rp);
-    if (!rp) return NULL;
-    rp->cfg = cfg; rp->loop = loop; rp->hb_slot = hb_slot;
-    rp->cap  = (int)((double)cfg->max_capture_secs / TB_FRAME_SECS) + 2;
-    rp->pkts = calloc((size_t)rp->cap, DMRD_LEN);
-    if (!rp->pkts) { free(rp); return NULL; }
-    return rp;
+int lane_replay_init(tb_lane *ln, int max_capture_secs) {
+    ln->rp.cap  = (int)((double)max_capture_secs / TB_FRAME_SECS) + 2;
+    ln->rp.pkts = calloc((size_t)ln->rp.cap, DMRD_LEN);
+    return ln->rp.pkts ? 0 : -1;
 }
 
-void replay_free(replay *rp) {
-    if (!rp) return;
-    if (rp->timer) ev_timer_cancel(rp->loop, rp->timer);
-    free(rp->pkts);
-    free(rp);
+void lane_replay_cleanup(tb_lane *ln) {
+    if (ln->rp.timer) ev_timer_cancel(instance_loop(ln->inst), ln->rp.timer);
+    ln->rp.timer = NULL;
+    free(ln->rp.pkts);
+    ln->rp.pkts = NULL;
 }
 
-int replay_active(const replay *rp) { return rp->active; }
+int lane_replay_active(const tb_lane *ln) { return ln->rp.active; }
 
-void replay_abort(replay *rp) {
-    if (rp->timer) { ev_timer_cancel(rp->loop, rp->timer); rp->timer = NULL; }
-    rp->active = 0;
-    rp->idx = 0;
-    rp->n = 0;
+void lane_replay_abort(tb_lane *ln) {
+    if (ln->rp.timer) { ev_timer_cancel(instance_loop(ln->inst), ln->rp.timer); ln->rp.timer = NULL; }
+    ln->rp.active = 0;
+    ln->rp.idx = 0;
+    ln->rp.n = 0;
 }
 
-void replay_start(replay *rp, const tb_capture *capd) {
-    if (rp->active) { LOGW(LOGN, "replay already in flight — ignoring"); return; }
-    if (capd->n <= 0) return;
+void lane_replay_start(tb_lane *ln) {
+    if (ln->rp.active) { LOGW(LOGN, "[%s] TS%d replay already in flight — ignoring",
+                              instance_name(ln->inst), ln->slot); return; }
+    if (ln->cap.n <= 0) return;
 
-    int n = capd->n;
-    if (n > rp->cap) n = rp->cap;
-    memcpy(rp->pkts, capd->pkts, (size_t)n * DMRD_LEN);
-    rp->n = n;
+    int n = ln->cap.n;
+    if (n > ln->rp.cap) n = ln->rp.cap;
+    memcpy(ln->rp.pkts, ln->cap.pkts, (size_t)n * DMRD_LEN);
+    ln->rp.n = n;
 
-    /* The reply mirrors the inbound call type; only the destination differs.
-     *   group in  -> back onto the same talkgroup
-     *   unit  in  -> a private call back to whoever called us
-     * Both are sourced from our own radio ID. */
-    const uint8_t *dst = capd->is_unit ? capd->src : capd->dst;
+    /* The reply goes back onto the talkgroup it was captured from, sourced
+     * from our own radio ID. */
+    uint8_t dst[3] = { (uint8_t)(ln->tgid >> 16), (uint8_t)(ln->tgid >> 8), (uint8_t)ln->tgid };
 
     uint32_t sid = ((uint32_t)rand() << 16) ^ (uint32_t)rand();
     if (sid == 0) sid = 1;
-    tb_rewrite_init(&rp->rw, rp->cfg->radio_id, dst, capd->is_unit, sid);
+    tb_rewrite_init(&ln->rp.rw, instance_cfg(ln->inst)->radio_id, dst, sid);
 
-    rp->active = 1;
-    rp->timer = ev_timer_after(rp->loop, rp->cfg->replay_delay, begin_cb, rp);
+    ln->rp.active = 1;
+    ln->rp.timer = ev_timer_after(instance_loop(ln->inst),
+                                  instance_cfg(ln->inst)->replay_delay, begin_cb, ln);
 }

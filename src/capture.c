@@ -1,7 +1,14 @@
-/* capture.c — the talkback object: ingress gate and capture buffer.
+/* capture.c — the instance object: ingress gate and per-lane capture buffers.
  *
- * Receives DMRD from the HBP client, decides whether the stream is one we
- * answer, buffers it verbatim, and hands the finished buffer to replay.c.
+ * Receives DMRD from this instance's HBP client, decides which lane (if any)
+ * the stream belongs to, buffers it verbatim, and hands the finished buffer to
+ * replay.c.
+ *
+ * Talkback answers GROUP CALLS ONLY.  Private calls are ignored: unit routing
+ * draws on a globally administered radio-ID namespace, and a self-hosted tool
+ * that anyone can deploy cannot demand a unique registered ID per instance.
+ * Talkgroups are operator-scoped and bounded by the operator's own rules, so
+ * they cost nobody else anything.
  */
 #include "talkback.h"
 #include "hbp.h"
@@ -13,14 +20,12 @@
 
 #define LOGN "talkback"
 
-struct talkback {
-    const Config *cfg;
-    ev_loop      *loop;
-    struct hbp   *hb;
-    tb_capture    cap;
-    replay       *rp;
-    ev_timer     *sweep_timer;
-    uint8_t       radio_id[3];   /* 24-bit form, for unit-call matching */
+struct tb_instance {
+    const InstanceCfg *cfg;
+    ev_loop           *loop;
+    struct hbp        *hb;
+    tb_lane            lane[2];      /* index 0 = TS1, index 1 = TS2 */
+    uint8_t            radio_id[3];
 };
 
 static uint32_t rd24(const uint8_t *p) {
@@ -30,157 +35,184 @@ static uint32_t rd32(const uint8_t *p) {
     return (uint32_t)p[0] << 24 | (uint32_t)p[1] << 16 | (uint32_t)p[2] << 8 | p[3];
 }
 
-static void close_capture(talkback *tb, const char *why);
+const char *instance_name(const tb_instance *in) { return in->cfg->name; }
+struct hbp *instance_hbp(const tb_instance *in)  { return in->hb; }
+const InstanceCfg *instance_cfg(const tb_instance *in) { return in->cfg; }
+ev_loop *instance_loop(const tb_instance *in)    { return in->loop; }
+
+int instance_lane_captured(const tb_instance *in, int slot) {
+    if (slot != 1 && slot != 2) return 0;
+    return in->lane[slot - 1].cap.n;
+}
+
+int instance_lane_replaying(const tb_instance *in, int slot) {
+    if (slot != 1 && slot != 2) return 0;
+    return lane_replay_active(&in->lane[slot - 1]);
+}
+
+static void close_capture(tb_lane *ln, const char *why);
 static void sweep_cb(ev_loop *loop, void *ud);
 
-static void arm_sweep(talkback *tb) {
-    if (tb->sweep_timer) return;
-    tb->sweep_timer = ev_timer_after(tb->loop, TB_STREAM_TIMEOUT, sweep_cb, tb);
+static void arm_sweep(tb_lane *ln) {
+    if (ln->sweep) return;
+    ln->sweep = ev_timer_after(ln->inst->loop, TB_STREAM_TIMEOUT, sweep_cb, ln);
 }
 
 /* Watchdog for a stream whose terminator never arrived.  Without this a lost
- * tail would pin the buffer and the talkback would go deaf. */
+ * tail would pin the lane and that slot would go deaf. */
 static void sweep_cb(ev_loop *loop, void *ud) {
-    talkback *tb = ud;
-    tb->sweep_timer = NULL;
-    if (!tb->cap.active) return;
-    if (ev_now(loop) - tb->cap.last_pkt >= TB_STREAM_TIMEOUT) {
-        close_capture(tb, "no terminator (lost tail)");
+    tb_lane *ln = ud;
+    ln->sweep = NULL;
+    if (!ln->cap.active) return;
+    if (ev_now(loop) - ln->cap.last_pkt >= TB_STREAM_TIMEOUT) {
+        close_capture(ln, "no terminator (lost tail)");
         return;
     }
-    arm_sweep(tb);
+    arm_sweep(ln);
 }
 
-static void close_capture(talkback *tb, const char *why) {
-    if (!tb->cap.active) return;
-    tb->cap.active = 0;
-    if (tb->cap.n == 0) return;
+static void close_capture(tb_lane *ln, const char *why) {
+    if (!ln->cap.active) return;
+    ln->cap.active = 0;
+    if (ln->cap.n == 0) return;
 
-    double dur = tb->cap.last_pkt - tb->cap.started;
-    LOGI(LOGN, "capture end   — %s, %d packets, %.1fs", why, tb->cap.n, dur);
-    replay_start(tb->rp, &tb->cap);
-}
-
-/* ---------------- ingress gate ---------------- */
-
-/* Decide whether this packet belongs to a stream we answer.  Returns 1 to
- * accept, 0 to ignore.  Fills *is_unit and *slot. */
-static int gate(talkback *tb, const uint8_t *pkt, int *is_unit, int *slot) {
-    uint8_t flags = pkt[DMRD_FLAGS_OFF];
-    *slot    = (flags & HBPF_TGID_TS2) ? 2 : 1;
-    *is_unit = (flags & HBPF_TGID_CALL_P) ? 1 : 0;
-
-    const Config *c = tb->cfg;
-    if (*is_unit) {
-        if (!cfg_does_unit(c)) return 0;
-        if (!cfg_unit_slot_ok(c, *slot)) return 0;
-        /* A private call is for us only if it is addressed to our radio ID. */
-        if (memcmp(pkt + DMRD_DST_OFF, tb->radio_id, 3) != 0) return 0;
-        return 1;
-    }
-    if (!cfg_does_group(c)) return 0;
-    return cfg_group_match(c, *slot, rd24(pkt + DMRD_DST_OFF));
+    LOGI(LOGN, "[%s] TS%d capture end   — %s, %d packets, %.1fs",
+         ln->inst->cfg->name, ln->slot, why, ln->cap.n,
+         ln->cap.last_pkt - ln->cap.started);
+    lane_replay_start(ln);
 }
 
 /* ---------------- public API ---------------- */
 
-talkback *talkback_new(const Config *cfg, ev_loop *loop) {
-    talkback *tb = calloc(1, sizeof *tb);
-    if (!tb) return NULL;
-    tb->cfg  = cfg;
-    tb->loop = loop;
-    tb->radio_id[0] = (uint8_t)(cfg->radio_id >> 16);
-    tb->radio_id[1] = (uint8_t)(cfg->radio_id >> 8);
-    tb->radio_id[2] = (uint8_t)(cfg->radio_id);
+tb_instance *instance_new(const InstanceCfg *ic, ev_loop *loop) {
+    tb_instance *in = calloc(1, sizeof *in);
+    if (!in) return NULL;
+    in->cfg  = ic;
+    in->loop = loop;
+    in->radio_id[0] = (uint8_t)(ic->radio_id >> 16);
+    in->radio_id[1] = (uint8_t)(ic->radio_id >> 8);
+    in->radio_id[2] = (uint8_t)(ic->radio_id);
 
-    /* Fixed buffer, sized once, from the configured ceiling. */
-    tb->cap.cap  = (int)ceil((double)cfg->max_capture_secs / TB_FRAME_SECS);
-    tb->cap.pkts = calloc((size_t)tb->cap.cap, DMRD_LEN);
-    if (!tb->cap.pkts) { free(tb); return NULL; }
+    int npkts = (int)ceil((double)ic->max_capture_secs / TB_FRAME_SECS);
 
-    tb->rp = replay_new(cfg, loop, &tb->hb);
-    if (!tb->rp) { free(tb->cap.pkts); free(tb); return NULL; }
+    for (int i = 0; i < 2; i++) {
+        tb_lane *ln = &in->lane[i];
+        ln->inst = in;
+        ln->slot = i + 1;
+        ln->tgid = cfg_slot_tgid(ic, ln->slot);
+        if (!ln->tgid) continue;                 /* slot unused: no buffers */
 
-    LOGI(LOGN, "capture buffer: %d packets (%d s max), %d bytes",
-         tb->cap.cap, cfg->max_capture_secs, tb->cap.cap * DMRD_LEN);
-    return tb;
+        ln->cap.cap  = npkts;
+        ln->cap.pkts = calloc((size_t)npkts, DMRD_LEN);
+        if (!ln->cap.pkts || lane_replay_init(ln, ic->max_capture_secs) != 0) {
+            instance_free(in);
+            return NULL;
+        }
+        LOGI(LOGN, "[%s] TS%d answering TG %u — buffer %d packets (%d s, %d bytes)",
+             ic->name, ln->slot, ln->tgid, npkts, ic->max_capture_secs, npkts * DMRD_LEN);
+    }
+    return in;
 }
 
-void talkback_set_hbp(talkback *tb, struct hbp *hb) { tb->hb = hb; }
+void instance_set_hbp(tb_instance *in, struct hbp *hb) { in->hb = hb; }
 
-void talkback_free(talkback *tb) {
-    if (!tb) return;
-    if (tb->sweep_timer) ev_timer_cancel(tb->loop, tb->sweep_timer);
-    replay_free(tb->rp);
-    free(tb->cap.pkts);
-    free(tb);
+void instance_free(tb_instance *in) {
+    if (!in) return;
+    for (int i = 0; i < 2; i++) {
+        tb_lane *ln = &in->lane[i];
+        if (ln->sweep) ev_timer_cancel(in->loop, ln->sweep);
+        lane_replay_cleanup(ln);
+        free(ln->cap.pkts);
+    }
+    free(in);
 }
 
-void tb_hbp_connected(talkback *tb) {
-    LOGI(LOGN, "connected — radio ID %u, mode %s", tb->cfg->radio_id,
-         tb->cfg->mode == MODE_BOTH ? "BOTH" :
-         tb->cfg->mode == MODE_GROUP ? "GROUP" : "UNIT");
+void tb_hbp_connected(tb_instance *in) {
+    LOGI(LOGN, "[%s] connected — radio ID %u, options %s",
+         in->cfg->name, in->cfg->radio_id, in->cfg->options);
 }
 
-void tb_hbp_disconnected(talkback *tb) {
-    LOGW(LOGN, "disconnected — discarding any capture/replay in flight");
-    tb->cap.active = 0;
-    tb->cap.n = 0;
-    replay_abort(tb->rp);
+void tb_hbp_disconnected(tb_instance *in) {
+    LOGW(LOGN, "[%s] disconnected — discarding captures and replays in flight",
+         in->cfg->name);
+    for (int i = 0; i < 2; i++) {
+        tb_lane *ln = &in->lane[i];
+        ln->cap.active = 0;
+        ln->cap.n = 0;
+        lane_replay_abort(ln);
+    }
 }
 
-void tb_hbp_voice_received(talkback *tb, const uint8_t *pkt, int len) {
+void tb_hbp_voice_received(tb_instance *in, const uint8_t *pkt, int len) {
     if (len < DMRD_LEN) {
-        LOGD(LOGN, "short DMRD (%d bytes) ignored", len);
+        LOGD(LOGN, "[%s] short DMRD (%d bytes) ignored", in->cfg->name, len);
         return;
     }
 
-    /* busy_policy = ignore: nothing is captured while a replay is live.
-     * Our own replay comes back to us on no sane master, but a *different*
-     * caller keying up mid-replay would otherwise truncate the echo. */
-    if (replay_active(tb->rp)) return;
+    uint8_t flags = pkt[DMRD_FLAGS_OFF];
+    int slot = (flags & HBPF_TGID_TS2) ? 2 : 1;
 
-    int is_unit, slot;
-    if (!gate(tb, pkt, &is_unit, &slot)) return;
-
-    uint32_t sid  = rd32(pkt + DMRD_STREAM_OFF);
-    double   now  = ev_now(tb->loop);
-    uint8_t  fl   = pkt[DMRD_FLAGS_OFF];
-    int      ftyp = fl & HBPF_FRAMETYPE_MASK;
-    int      dtyp = fl & HBPF_DTYPE_MASK;
-
-    if (!tb->cap.active || tb->cap.stream_id != sid) {
-        /* New stream.  Any half-captured previous one is abandoned: it lost
-         * its terminator and a fresh call is more interesting than a stale
-         * fragment. */
-        if (tb->cap.active)
-            LOGD(LOGN, "new stream %08x supersedes incomplete %08x", sid, tb->cap.stream_id);
-        tb->cap.active    = 1;
-        tb->cap.stream_id = sid;
-        tb->cap.slot      = slot;
-        tb->cap.is_unit   = is_unit;
-        tb->cap.started   = now;
-        tb->cap.n         = 0;
-        memcpy(tb->cap.src, pkt + DMRD_SRC_OFF, 3);
-        memcpy(tb->cap.dst, pkt + DMRD_DST_OFF, 3);
-        LOGI(LOGN, "capture start — %s call from %u to %u, TS%d, stream %08x",
-             is_unit ? "unit" : "group", rd24(tb->cap.src), rd24(tb->cap.dst), slot, sid);
-        arm_sweep(tb);
+    /* Group calls only — see the file header for why. */
+    if (flags & HBPF_TGID_CALL_P) {
+        if (memcmp(pkt + DMRD_DST_OFF, in->radio_id, 3) == 0)
+            LOGD(LOGN, "[%s] private call to our radio ID ignored — talkback "
+                       "answers group calls only; use TG %u on TS%d",
+                 in->cfg->name, cfg_slot_tgid(in->cfg, slot), slot);
+        return;
     }
 
-    tb->cap.last_pkt = now;
+    tb_lane *ln = &in->lane[slot - 1];
+    if (!ln->tgid) return;                                  /* slot unused */
+    if (rd24(pkt + DMRD_DST_OFF) != ln->tgid) return;       /* not our TG */
 
-    if (tb->cap.n < tb->cap.cap) {
-        memcpy(tb->cap.pkts + (size_t)tb->cap.n * DMRD_LEN, pkt, DMRD_LEN);
-        tb->cap.n++;
-    } else if (tb->cap.n == tb->cap.cap) {
+    /* This lane is busy playing back.  The other lane is unaffected. */
+    if (lane_replay_active(ln)) return;
+
+    uint32_t sid  = rd32(pkt + DMRD_STREAM_OFF);
+    double   now  = ev_now(in->loop);
+    int      ftyp = flags & HBPF_FRAMETYPE_MASK;
+    int      dtyp = flags & HBPF_DTYPE_MASK;
+
+    if (ln->cap.active && ln->cap.stream_id != sid) {
+        /* Two streams on one lane.  The wire should not produce this — a
+         * timeslot carries one call at a time and the server arbitrates — but
+         * if it does, first-come-wins.  Superseding unconditionally would let
+         * interleaved packets reset the buffer on every frame and capture
+         * nothing at all. */
+        if (now - ln->cap.last_pkt < TB_SUPERSEDE_QUIET) {
+            LOGD(LOGN, "[%s] TS%d stream %08x ignored — %08x still live",
+                 in->cfg->name, slot, sid, ln->cap.stream_id);
+            return;
+        }
+        LOGD(LOGN, "[%s] TS%d stream %08x supersedes stale %08x",
+             in->cfg->name, slot, sid, ln->cap.stream_id);
+        ln->cap.active = 0;
+    }
+
+    if (!ln->cap.active) {
+        ln->cap.active    = 1;
+        ln->cap.stream_id = sid;
+        ln->cap.started   = now;
+        ln->cap.n         = 0;
+        memcpy(ln->cap.src, pkt + DMRD_SRC_OFF, 3);
+        LOGI(LOGN, "[%s] TS%d capture start — from %u to TG %u, stream %08x",
+             in->cfg->name, slot, rd24(ln->cap.src), ln->tgid, sid);
+        arm_sweep(ln);
+    }
+
+    ln->cap.last_pkt = now;
+
+    if (ln->cap.n < ln->cap.cap) {
+        memcpy(ln->cap.pkts + (size_t)ln->cap.n * DMRD_LEN, pkt, DMRD_LEN);
+        ln->cap.n++;
+    } else {
         /* Ceiling reached.  Replay what we have rather than dropping it. */
-        LOGW(LOGN, "capture hit the %d s ceiling — replaying the first %d packets",
-             tb->cfg->max_capture_secs, tb->cap.n);
-        close_capture(tb, "max_capture_secs reached");
+        LOGW(LOGN, "[%s] TS%d hit the %d s ceiling — replaying the first %d packets",
+             in->cfg->name, slot, in->cfg->max_capture_secs, ln->cap.n);
+        close_capture(ln, "max_capture_secs reached");
         return;
     }
 
     if (ftyp == HBPF_FRAMETYPE_DATASYNC && dtyp == HBPF_SLT_VTERM)
-        close_capture(tb, "terminator");
+        close_capture(ln, "terminator");
 }

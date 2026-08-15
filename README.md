@@ -1,6 +1,6 @@
 # dmr-talkback
 
-A DMR **voice test** endpoint. It connects to an HBP master exactly as an
+A DMR **voice test** endpoint. It connects to an HBP server exactly as an
 ordinary repeater does, records one call, and plays it back so the caller can
 hear how they sound.
 
@@ -15,42 +15,101 @@ serves the HomeBrew protocol.
 
 ## What it does
 
-- Answers **group calls**, **private (unit) calls**, or both.
-- The reply mirrors the call it received. A group call is replayed onto the same
-  talkgroup so everyone listening hears it; a private call to the talkback's
-  radio ID is answered with a private call back to whoever placed it.
+- Answers **group calls** on a talkgroup you choose, per timeslot.
+- The reply goes back onto the same talkgroup, so everyone listening hears it.
 - Every reply is sourced from the talkback's own radio ID, in the DMRD header
   **and** in the Link Control carried inside the voice payload, so radios and
   MMDVMHost display the talkback rather than the original caller.
 - The audio is never re-encoded. AMBE comes back bit-for-bit as it went in.
+- **The two timeslots are fully independent.** A caller on TS1 and a caller on
+  TS2 are recorded and replayed at the same time without interfering.
+- **One process runs as many instances as you like**, each connecting to its own
+  server with its own talkgroups.
+
+## Group calls only
+
+Talkback is never addressed by radio ID, and private calls to it are ignored.
+
+That is deliberate. Talkgroup numbers are yours: you hand them out inside your
+own network and bound their reach with your own rules, and it costs nobody else
+anything. Radio IDs are a globally administered namespace, and unit-call routing
+is unbounded — a private call to an unknown ID floods until the target is found,
+and the map that results is global. For talkback to be reachable by ID, every
+instance anyone ever deployed would need its own globally unique registered
+radio ID, for something that is neither a radio nor a repeater.
+
+BrandMeister can use a private call to 9990 because BrandMeister is a single
+network that is the sole authority over its own namespace. These tools assume an
+internet of independent routers. The precedent doesn't transfer.
+
+The practical upshot is good news: the talkback's radio ID never needs to be
+reachable, so **one ID you already own can serve every instance you run.**
 
 ## Configuration
 
-One radio ID does everything: it is the HBP login ID, the DMRD repeater ID on
-every packet transmitted, the source of the replayed call, and the ID users
-private-call to reach the talkback.
-
 ```toml
-[talkback]
-radio_id        = 3120099
-mode            = "BOTH"        # GROUP | UNIT | BOTH
-group_ts2_tgids = [9990]        # talkgroups answered, per slot
-unit_slots      = [1, 2]        # slots a private call is accepted on
-replay_delay_ms = 2000
-max_capture_secs = 30
+[global]
+log_level = "INFO"
 
-[master]
-ip         = "127.0.0.1"
-port       = 54000
-passphrase = "s3cr37w0rd"
+[instance.lawrence]
+radio_id    = 3120099
+slot1_tgid  = 0            # 0 or omitted = slot unused
+slot2_tgid  = 9990
+master_ip   = "127.0.0.1"
+master_port = 54000
+passphrase  = "s3cr37w0rd"
 ```
+
+**One talkgroup per slot**, deliberately. A DMR timeslot carries one call at a
+time, so a list would advertise capacity that doesn't exist. Two slots means
+exactly two callers can be served at once, and the config says so plainly.
+
+The slot talkgroups are also sent to the server as an RPTO subscription
+(`TS1=…;TS2=…`) at login. That is not cosmetic: HBlink4 will not deliver a
+talkgroup to a repeater that hasn't subscribed to it. HBlink3 ignores it.
 
 See [talkback.toml.sample](talkback.toml.sample) for the fully commented
 version.
 
-The talkgroup lists are also sent to the master as an RPTO subscription
-(`TS1=…;TS2=…`) at login. That is not cosmetic: HBlink4 will not deliver a
-talkgroup to a repeater that hasn't subscribed to it. HBlink3 ignores it.
+### Running more than one instance
+
+An HBlink3 server hosts several independent **systems**. Normally, giving all of
+them a talkback means building a bridge that multiplexes every system into one
+talkback engine — bridge rules to write, and one shared talkback that every
+system contends for.
+
+Instead, run one instance per system. Each system gets its own private talkback
+on its own TGID, no bridge required, and no system can tie up another's:
+
+```toml
+[instance.lawrence]
+radio_id = 3120099
+slot2_tgid = 9990
+master_port = 54000
+# ...
+
+[instance.topeka]
+radio_id = 3120098
+slot2_tgid = 9991
+master_port = 54010
+# ...
+```
+
+Bridging everyone into a **single** instance is still perfectly valid if that's
+the behavior you want — one talkback heard across several systems. Both work;
+pick the one that matches how you want it to behave.
+
+Two things to know:
+
+- **Don't point one process at several different HBlink3 servers.** Instances
+  are independent so it would function, but you've made one process a single
+  point of failure for several servers and interleaved the logs of unrelated
+  networks. Run a process per server.
+- **HBlink4 has no "system" concept** — the server is the unit. One instance per
+  HBlink4 server is the only arrangement that makes sense.
+
+Instances may share a radio ID across *different* servers. Two instances on the
+*same* server may not, and that's rejected at startup.
 
 ## Build and install
 
@@ -74,11 +133,13 @@ Run it in the foreground while you're setting it up:
 
 ## Connecting it
 
-Keep the master on loopback where you can — then the passphrase never touches
-the network.
+Where talkback runs on the same server as HBlink3/4, and those programs listen
+on the loopback, connect to the loopback — it avoids extra overhead on the live
+network port and keeps the passphrase off the wire.
 
-**HBlink3** — add a `MODE: SERVER` system for it to log into, and give its
-talkgroup a bridge in `rules.py` so traffic reaches it.
+**HBlink3** — add a `MODE: SERVER` system for each instance to log into. With one
+instance per system you need no bridge at all; if you'd rather have one shared
+talkback, bridge its talkgroup in `rules.py` instead.
 
 **HBlink4** — add an access-control entry for the radio ID. The `Options=`
 subscription handles the rest; no per-talkgroup server config is needed.
@@ -89,22 +150,25 @@ subscription handles the rest; no per-talkgroup server config is needed.
 make test
 ```
 
-The conformance vector is the loopback identity: a synthetic capture covering
-every frame kind is rewritten and then checked to confirm the AMBE is
-bit-identical, the header addressing is entirely ours, the full LC in the voice
-header and terminator decodes back to the new addressing, the embedded LC
-fragments in bursts B–E match, the slot-type/sync window (which carries the
-colour code) is untouched, and group and unit replies differ in exactly three
-places and nowhere else.
+Two suites:
+
+**`test_rewrite`** — the loopback identity. A synthetic capture covering every
+frame kind is rewritten and checked to confirm the AMBE is bit-identical, the
+header addressing is entirely ours, the full LC in the voice header and
+terminator decodes back to the new addressing, the embedded LC fragments in
+bursts B–E match, the slot-type/sync window (which carries the colour code) is
+untouched, and a stray private-call bit is forced clear.
+
+**`test_lanes`** — the concurrency model. Two calls interleaved across TS1 and
+TS2 are both captured in full; two streams arriving on one slot don't thrash it
+(first-come-wins); and the ingress gate rejects the wrong talkgroup, an unused
+slot, and private calls without opening a capture.
 
 ## Notes and limitations
 
-- **Unit mode needs a master that routes private calls.** HBlink3 and HBlink4
-  both do, and both learn where the talkback lives from its first transmission.
-  XLXD and plain HBP masters may not route unit calls at all, which makes unit
-  mode a no-op there. Group mode works everywhere.
-- Only one call is handled at a time. A transmission arriving while a replay is
-  in progress is ignored rather than truncating the echo.
+- One call per slot at a time. A transmission arriving on a slot that is already
+  playing back is ignored rather than truncating the echo. The other slot is
+  unaffected.
 - HBP only. There is no IPSC support; reach it through a bridge.
 - No announcements, no ID lookups, no database, no dashboard. It records and it
   replays.

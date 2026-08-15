@@ -10,9 +10,9 @@
 #include "eventloop.h"
 
 typedef struct hbp hbp;
-struct talkback;
+struct tb_instance;
 
-hbp *hbp_new(const Config *cfg, struct talkback *app, ev_loop *loop);
+hbp *hbp_new(const InstanceCfg *cfg, struct tb_instance *app, ev_loop *loop);
 void hbp_start(hbp *hb);       /* connect and keep connected */
 void hbp_stop(hbp *hb);        /* clean shutdown: RPTCL + cancel timers */
 void hbp_free(hbp *hb);

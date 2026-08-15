@@ -27,4 +27,11 @@ void  toml_free(toml *t);
 /* Look up section.key.  Returns NULL if absent. */
 const toml_value *toml_get(const toml *t, const char *section, const char *key);
 
+/* talkback: local addition to the vendored reader.
+ * Enumerate distinct section names beginning with `prefix`, in file order.
+ * Writes up to `cap` names into out[]; returns the number written.  Used to
+ * discover [instance.<name>] sections without making the operator also list
+ * them, since this reader has no array-of-tables. */
+int toml_sections(const toml *t, const char *prefix, char out[][64], int cap);
+
 #endif

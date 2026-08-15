@@ -79,16 +79,26 @@ uninstall:
 	@echo "Removed binary and unit. Left $(CONFDIR) intact (delete manually if desired)."
 
 # Sources the tests link against (no main, no net).  The HBP client is stubbed
-# inside the test itself.
-TEST_SUPPORT := $(SRC_DIR)/replay.c $(SRC_DIR)/log.c $(SRC_DIR)/eventloop.c $(DMR_SOURCES)
+# inside each test.
+TEST_BASE   := $(SRC_DIR)/log.c $(SRC_DIR)/eventloop.c $(DMR_SOURCES)
+# test_rewrite stubs the instance accessors, so it links replay.c without capture.c.
+TEST_REWRITE := $(SRC_DIR)/replay.c $(TEST_BASE)
+# test_lanes drives the real capture path, so it needs both.
+TEST_LANES   := $(SRC_DIR)/capture.c $(SRC_DIR)/replay.c $(TEST_BASE)
 
 # test_rewrite: the loopback-identity conformance vector — replayed AMBE is
-# bit-identical to captured AMBE, headers are rewritten, and the LC in both
-# carriers decodes back to the new addressing.
-test: tests/test_rewrite.c $(TEST_SUPPORT)
+#   bit-identical to captured AMBE, headers are rewritten, and the LC in both
+#   carriers decodes back to the new addressing.
+# test_lanes:   the concurrency model — TS1 and TS2 capture independently and
+#   simultaneously, one lane never thrashes, and the ingress gate holds.
+test: tests/test_rewrite.c tests/test_lanes.c $(TEST_LANES)
 	$(CC) $(CFLAGS) -I$(SRC_DIR) -o /tmp/talkback_test_rewrite \
-		tests/test_rewrite.c $(TEST_SUPPORT) $(LDFLAGS)
+		tests/test_rewrite.c $(TEST_REWRITE) $(LDFLAGS)
 	/tmp/talkback_test_rewrite
+	@echo
+	$(CC) $(CFLAGS) -I$(SRC_DIR) -o /tmp/talkback_test_lanes \
+		tests/test_lanes.c $(TEST_LANES) $(LDFLAGS)
+	/tmp/talkback_test_lanes
 
 clean:
 	rm -f $(OBJECTS) $(BIN)

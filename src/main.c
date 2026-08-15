@@ -1,8 +1,8 @@
 /* main.c — dmr-talkback entry point.
  *
- * Wires the HBP client to the capture/replay pair and runs the event loop.
- * That is the whole program: connect as a repeater, record a call, play it
- * back sourced from our own radio ID.
+ * Builds N independent talkback instances from the config, gives each its own
+ * HBP client, and runs them all on one event loop.  Instances share nothing;
+ * the process exists only so an operator manages one service instead of six.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -17,13 +17,16 @@
 #include "hbp.h"
 #include "talkback.h"
 
-static ev_loop  *g_loop = NULL;
-static hbp      *g_hbp  = NULL;
+static ev_loop     *g_loop = NULL;
+static hbp         *g_hbp[CFG_MAX_INSTANCES];
+static tb_instance *g_inst[CFG_MAX_INSTANCES];
+static int          g_n = 0;
 
 static void on_signal(int signum)
 {
     LOGI("talkback", "Signal %d received — shutting down", signum);
-    if (g_hbp)  hbp_stop(g_hbp);
+    for (int i = 0; i < g_n; i++)
+        if (g_hbp[i]) hbp_stop(g_hbp[i]);
     if (g_loop) ev_stop(g_loop);
 }
 
@@ -57,7 +60,7 @@ int main(int argc, char **argv)
         }
     }
 
-    Config cfg;
+    static Config cfg;
     char err[4096];
     if (config_load(cfg_path, &cfg, err, sizeof err) != 0) {
         fprintf(stderr, "Configuration error: %s\n", err);
@@ -73,33 +76,39 @@ int main(int argc, char **argv)
 
     srand((unsigned)time(NULL) ^ (unsigned)getpid());
 
-    LOGI("talkback", "dmr-talkback starting — radio ID %u, mode %s, master %s:%d",
-         cfg.radio_id,
-         cfg.mode == MODE_BOTH ? "BOTH" : cfg.mode == MODE_GROUP ? "GROUP" : "UNIT",
-         cfg.master_ip, cfg.master_port);
-    if (cfg.options[0])
-        LOGI("talkback", "subscribing with options: %s", cfg.options);
-    else
-        LOGI("talkback", "no group talkgroups configured — unit calls only");
+    LOGI("talkback", "dmr-talkback starting — %d instance%s",
+         cfg.n_inst, cfg.n_inst == 1 ? "" : "s");
 
     g_loop = ev_new();
+    g_n = cfg.n_inst;
 
-    talkback *tb = talkback_new(&cfg, g_loop);
-    if (!tb) { fprintf(stderr, "Out of memory allocating the capture buffer\n"); return 1; }
+    for (int i = 0; i < cfg.n_inst; i++) {
+        const InstanceCfg *ic = &cfg.inst[i];
+        LOGI("talkback", "[%s] radio ID %u -> %s:%d",
+             ic->name, ic->radio_id, ic->master_ip, ic->master_port);
 
-    g_hbp = hbp_new(&cfg, tb, g_loop);
-    talkback_set_hbp(tb, g_hbp);
+        g_inst[i] = instance_new(ic, g_loop);
+        if (!g_inst[i]) {
+            fprintf(stderr, "Out of memory building instance '%s'\n", ic->name);
+            return 1;
+        }
+        g_hbp[i] = hbp_new(ic, g_inst[i], g_loop);
+        instance_set_hbp(g_inst[i], g_hbp[i]);
+    }
 
     struct sigaction sa; memset(&sa, 0, sizeof sa);
     sa.sa_handler = on_signal;
     sigaction(SIGTERM, &sa, NULL);
     sigaction(SIGINT,  &sa, NULL);
 
-    hbp_start(g_hbp);
+    for (int i = 0; i < g_n; i++) hbp_start(g_hbp[i]);
+
     ev_run(g_loop);
 
-    hbp_free(g_hbp);
-    talkback_free(tb);
+    for (int i = 0; i < g_n; i++) {
+        hbp_free(g_hbp[i]);
+        instance_free(g_inst[i]);
+    }
     ev_free(g_loop);
     LOGI("talkback", "dmr-talkback stopped");
     return 0;

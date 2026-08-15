@@ -21,8 +21,8 @@
 enum { ST_LOGIN, ST_AUTH_SENT, ST_CONFIG_SENT, ST_OPTIONS_SENT, ST_CONNECTED, ST_DISCONNECTED };
 
 struct hbp {
-    const Config      *cfg;
-    struct talkback   *app;
+    const InstanceCfg *cfg;
+    struct tb_instance *app;
     ev_loop           *loop;
     int                fd;
     int                active;
@@ -254,7 +254,7 @@ static void hbp_connect(hbp *hb)
 
 /* ---------------- public API ---------------- */
 
-hbp *hbp_new(const Config *cfg, struct talkback *app, ev_loop *loop)
+hbp *hbp_new(const InstanceCfg *cfg, struct tb_instance *app, ev_loop *loop)
 {
     hbp *hb = calloc(1, sizeof *hb);
     hb->cfg = cfg; hb->app = app; hb->loop = loop; hb->fd = -1;

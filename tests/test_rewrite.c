@@ -6,8 +6,8 @@
  *   and everything identifying the call is rewritten to us — in the DMRD
  *   header AND in both LC carriers inside the payload.
  *
- * These tests assert exactly that, for group and unit replies, over a
- * synthetic capture covering every frame kind a real stream contains.
+ * These tests assert exactly that over a synthetic capture covering every
+ * frame kind a real stream contains.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,10 +18,15 @@
 #include "hbp_const.h"
 #include "dmr/dmr.h"
 
-/* replay.c transmits through the HBP client; the rewrite path under test does
- * not, so stubs are enough to link. */
+/* replay.c transmits through the HBP client and reads back through the
+ * instance accessors; the rewrite path under test does neither, so stubs are
+ * enough to link. */
 void hbp_send_dmrd(struct hbp *hb, const uint8_t *data, int len) { (void)hb; (void)data; (void)len; }
 int  hbp_is_connected(struct hbp *hb) { (void)hb; return 0; }
+const char *instance_name(const tb_instance *in) { (void)in; return "test"; }
+struct hbp *instance_hbp(const tb_instance *in) { (void)in; return NULL; }
+const InstanceCfg *instance_cfg(const tb_instance *in) { (void)in; return NULL; }
+ev_loop *instance_loop(const tb_instance *in) { (void)in; return NULL; }
 
 static int failures = 0;
 static int checks   = 0;
@@ -69,11 +74,12 @@ static void mk_pkt(uint8_t *out, uint8_t seq, uint32_t src, uint32_t dst,
     out[DMRD_RSSI_OFF] = 0x5A;
 }
 
-/* Build VHEAD + 2 superframes (A..F) + VTERM = 14 packets, on TS2. */
+/* VHEAD + 2 superframes (A..F) + VTERM = 14 packets. */
 #define N_PKTS 14
-static int build_capture(uint8_t *buf, int is_unit, uint32_t dst)
+static int build_capture(uint8_t *buf, int slot, int call_p, uint32_t dst)
 {
-    uint8_t base = HBPF_TGID_TS2 | (is_unit ? HBPF_TGID_CALL_P : 0);
+    uint8_t base = (uint8_t)((slot == 2 ? HBPF_TGID_TS2 : 0) |
+                             (call_p ? HBPF_TGID_CALL_P : 0));
     int n = 0;
     uint8_t seq = 0;
 
@@ -99,9 +105,9 @@ static int build_capture(uint8_t *buf, int is_unit, uint32_t dst)
 /* Assertions                                                           */
 /* ------------------------------------------------------------------ */
 
-static void expected_lc(uint8_t lc[9], int is_unit, uint32_t dst, uint32_t src)
+static void expected_lc(uint8_t lc[9], uint32_t dst, uint32_t src)
 {
-    lc[0] = is_unit ? 0x03 : 0x00;   /* FLCO: group voice / unit voice */
+    lc[0] = 0x00;                    /* FLCO: group voice — always */
     lc[1] = 0x00;                    /* FID */
     lc[2] = 0x00;                    /* service options — normalized */
     wr24(lc + 3, dst);
@@ -119,19 +125,23 @@ static void extract_full_lc(const uint8_t *pkt, uint8_t lc_out[9])
     dmr_bptc_decode_full_lc(bptc_bits, lc_out);
 }
 
-static void run_case(const char *label, int is_unit, uint32_t inbound_dst, uint32_t reply_dst)
+/* `call_p` seeds the captured packets with the private-call bit set, to prove
+ * the rewrite forces it clear.  Real captures never carry it — the ingress
+ * gate rejects private calls — but the header must never be able to disagree
+ * with the group FLCO we build. */
+static void run_case(const char *label, int slot, int call_p, uint32_t tgid)
 {
     printf("%s\n", label);
 
     uint8_t in[N_PKTS * DMRD_LEN];
-    int n = build_capture(in, is_unit, inbound_dst);
+    int n = build_capture(in, slot, call_p, tgid);
 
-    uint8_t dst3[3]; wr24(dst3, reply_dst);
+    uint8_t dst3[3]; wr24(dst3, tgid);
     tb_rewrite rw;
-    tb_rewrite_init(&rw, TB_RADIO, dst3, is_unit, NEW_SID);
+    tb_rewrite_init(&rw, TB_RADIO, dst3, NEW_SID);
 
     uint8_t exp_lc[9];
-    expected_lc(exp_lc, is_unit, reply_dst, TB_RADIO);
+    expected_lc(exp_lc, tgid, TB_RADIO);
     CHECK(memcmp(rw.lc, exp_lc, 9) == 0,
           "reply LC mismatch: got %02x%02x%02x %06x %06x",
           rw.lc[0], rw.lc[1], rw.lc[2], rd24(rw.lc+3), rd24(rw.lc+6));
@@ -145,8 +155,8 @@ static void run_case(const char *label, int is_unit, uint32_t inbound_dst, uint3
         CHECK(op[DMRD_SEQ_OFF] == (uint8_t)i, "pkt %d: seq %u != %d", i, op[DMRD_SEQ_OFF], i);
         CHECK(rd24(op + DMRD_SRC_OFF) == TB_RADIO,
               "pkt %d: src %u != %u", i, rd24(op + DMRD_SRC_OFF), TB_RADIO);
-        CHECK(rd24(op + DMRD_DST_OFF) == reply_dst,
-              "pkt %d: dst %u != %u", i, rd24(op + DMRD_DST_OFF), reply_dst);
+        CHECK(rd24(op + DMRD_DST_OFF) == tgid,
+              "pkt %d: dst %u != %u", i, rd24(op + DMRD_DST_OFF), tgid);
         CHECK(rd32(op + DMRD_RPTR_OFF) == TB_RADIO,
               "pkt %d: repeater %u != %u", i, rd32(op + DMRD_RPTR_OFF), TB_RADIO);
         CHECK(rd32(op + DMRD_STREAM_OFF) == NEW_SID, "pkt %d: stream ID not rewritten", i);
@@ -156,7 +166,7 @@ static void run_case(const char *label, int is_unit, uint32_t inbound_dst, uint3
         CHECK((ofl & HBPF_TGID_TS2) == (ifl & HBPF_TGID_TS2), "pkt %d: slot bit changed", i);
         CHECK((ofl & HBPF_FRAMETYPE_MASK) == (ifl & HBPF_FRAMETYPE_MASK), "pkt %d: frame type changed", i);
         CHECK((ofl & HBPF_DTYPE_MASK) == (ifl & HBPF_DTYPE_MASK), "pkt %d: dtype/vseq changed", i);
-        CHECK(((ofl & HBPF_TGID_CALL_P) != 0) == (is_unit != 0), "pkt %d: call-type bit wrong", i);
+        CHECK((ofl & HBPF_TGID_CALL_P) == 0, "pkt %d: private-call bit not forced clear", i);
 
         /* ---- payload ---- */
         int ftyp = ifl & HBPF_FRAMETYPE_MASK;
@@ -194,45 +204,34 @@ static void run_case(const char *label, int is_unit, uint32_t inbound_dst, uint3
     }
 }
 
-/* Group and unit replies must differ in exactly three places and nowhere else. */
-static void run_diff_case(void)
+/* Two lanes rewritten independently must not bleed into each other: each keeps
+ * its own slot bit and its own talkgroup. */
+static void run_lane_independence(void)
 {
-    printf("group vs unit differ only in dst, call-type bit, and FLCO\n");
+    printf("TS1 and TS2 rewrites stay on their own slot and talkgroup\n");
 
-    uint8_t in[N_PKTS * DMRD_LEN];
-    int n = build_capture(in, 0, ORIG_TGID);
+    uint8_t in1[N_PKTS * DMRD_LEN], in2[N_PKTS * DMRD_LEN];
+    int n1 = build_capture(in1, 1, 0, 9u);
+    int n2 = build_capture(in2, 2, 0, ORIG_TGID);
+    CHECK(n1 == n2, "capture lengths differ");
 
-    uint8_t g_dst[3], u_dst[3];
-    wr24(g_dst, ORIG_TGID);
-    wr24(u_dst, ORIG_SRC);
+    uint8_t d1[3], d2[3];
+    wr24(d1, 9u); wr24(d2, ORIG_TGID);
+    tb_rewrite rw1, rw2;
+    tb_rewrite_init(&rw1, TB_RADIO, d1, 0xAAAA0001u);
+    tb_rewrite_init(&rw2, TB_RADIO, d2, 0xBBBB0002u);
 
-    tb_rewrite gr, ur;
-    tb_rewrite_init(&gr, TB_RADIO, g_dst, 0, NEW_SID);
-    tb_rewrite_init(&ur, TB_RADIO, u_dst, 1, NEW_SID);
+    for (int i = 0; i < n1; i++) {
+        uint8_t o1[DMRD_LEN], o2[DMRD_LEN];
+        tb_rewrite_packet(&rw1, in1 + i*DMRD_LEN, o1, (uint8_t)i);
+        tb_rewrite_packet(&rw2, in2 + i*DMRD_LEN, o2, (uint8_t)i);
 
-    CHECK(gr.lc[0] == 0x00 && ur.lc[0] == 0x03, "FLCO not 0x00 group / 0x03 unit");
-    CHECK(memcmp(gr.lc + 6, ur.lc + 6, 3) == 0, "source in LC should be identical");
-
-    for (int i = 0; i < n; i++) {
-        uint8_t go[DMRD_LEN], uo[DMRD_LEN];
-        tb_rewrite_packet(&gr, in + i*DMRD_LEN, go, (uint8_t)i);
-        tb_rewrite_packet(&ur, in + i*DMRD_LEN, uo, (uint8_t)i);
-
-        CHECK(memcmp(go, uo, DMRD_DST_OFF) == 0, "pkt %d: bytes before dst differ", i);
-        CHECK(memcmp(go + DMRD_RPTR_OFF, uo + DMRD_RPTR_OFF,
-                     DMRD_FLAGS_OFF - DMRD_RPTR_OFF) == 0, "pkt %d: repeater differs", i);
-        CHECK((go[DMRD_FLAGS_OFF] & ~HBPF_TGID_CALL_P) ==
-              (uo[DMRD_FLAGS_OFF] & ~HBPF_TGID_CALL_P),
-              "pkt %d: flags differ outside the call-type bit", i);
-
-        uint8_t fl = in[i*DMRD_LEN + DMRD_FLAGS_OFF];
-        int ftyp = fl & HBPF_FRAMETYPE_MASK, dtyp = fl & HBPF_DTYPE_MASK;
-        int carries_lc = (ftyp == HBPF_FRAMETYPE_DATASYNC &&
-                          (dtyp == HBPF_SLT_VHEAD || dtyp == HBPF_SLT_VTERM)) ||
-                         (ftyp == HBPF_FRAMETYPE_VOICE && dtyp >= 1 && dtyp <= 4);
-        if (!carries_lc)
-            CHECK(memcmp(go + DMRD_PAYLOAD_OFF, uo + DMRD_PAYLOAD_OFF, 33) == 0,
-                  "pkt %d: non-LC payload differs between group and unit", i);
+        CHECK((o1[DMRD_FLAGS_OFF] & HBPF_TGID_TS2) == 0, "pkt %d: TS1 reply left TS1", i);
+        CHECK((o2[DMRD_FLAGS_OFF] & HBPF_TGID_TS2) != 0, "pkt %d: TS2 reply left TS2", i);
+        CHECK(rd24(o1 + DMRD_DST_OFF) == 9u, "pkt %d: TS1 reply wrong TG", i);
+        CHECK(rd24(o2 + DMRD_DST_OFF) == ORIG_TGID, "pkt %d: TS2 reply wrong TG", i);
+        CHECK(rd32(o1 + DMRD_STREAM_OFF) != rd32(o2 + DMRD_STREAM_OFF),
+              "pkt %d: lanes share a stream ID", i);
     }
 }
 
@@ -240,11 +239,10 @@ int main(void)
 {
     printf("dmr-talkback rewrite conformance\n\n");
 
-    run_case("group call -> replayed onto the same talkgroup",
-             0, ORIG_TGID, ORIG_TGID);
-    run_case("unit call  -> private reply to the original caller",
-             1, TB_RADIO, ORIG_SRC);
-    run_diff_case();
+    run_case("group call on TS2 -> replayed onto the same talkgroup", 2, 0, ORIG_TGID);
+    run_case("group call on TS1 -> replayed onto the same talkgroup", 1, 0, 9u);
+    run_case("stray private-call bit is forced clear on the reply",   2, 1, ORIG_TGID);
+    run_lane_independence();
 
     printf("\n%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;

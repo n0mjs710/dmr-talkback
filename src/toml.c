@@ -223,3 +223,22 @@ const toml_value *toml_get(const toml *t, const char *section, const char *key)
             return &t->entries[i].val;
     return NULL;
 }
+
+/* talkback: local addition — see toml.h. */
+int toml_sections(const toml *t, const char *prefix, char out[][64], int cap)
+{
+    size_t plen = strlen(prefix);
+    int n = 0;
+    for (int i = 0; i < t->n; i++) {
+        const char *s = t->entries[i].section;
+        if (strncmp(s, prefix, plen) != 0) continue;
+        int seen = 0;
+        for (int j = 0; j < n; j++)
+            if (!strcmp(out[j], s)) { seen = 1; break; }
+        if (seen) continue;
+        if (n >= cap) return n;
+        snprintf(out[n], 64, "%s", s);
+        n++;
+    }
+    return n;
+}
