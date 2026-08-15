@@ -108,14 +108,9 @@ Two things to know:
 **Sharing one radio ID across instances is fine**, and is the normal
 arrangement — group-only talkback never has anything routed to its ID, so it
 carries no addressing meaning. Six instances on six HBlink3 systems can all use
-the same ID.
-
-The single exception is per *listening socket*, and it is a registration
-constraint rather than a routing one: an HBP server keys its registered
-repeaters by radio ID and then validates the source address on every packet, so
-two connections to the **same `ip:port`** with the same ID share one entry and
-fight over it. Each HBlink3 system listens on its own port, so this only bites
-if you point two instances at the same system. It's rejected at startup.
+the same ID. Do not connect two talkback instances to the same HBlink3 system or
+HBlink4 without using different radio IDs for each -- though one would wonder why
+you might do this -- hey, I won't judge!
 
 ## Build and install
 
@@ -149,26 +144,6 @@ talkback, bridge its talkgroup in `rules.py` instead.
 
 **HBlink4** — add an access-control entry for the radio ID. The `Options=`
 subscription handles the rest; no per-talkgroup server config is needed.
-
-## Tests
-
-```sh
-make test
-```
-
-Two suites:
-
-**`test_rewrite`** — the loopback identity. A synthetic capture covering every
-frame kind is rewritten and checked to confirm the AMBE is bit-identical, the
-header addressing is entirely ours, the full LC in the voice header and
-terminator decodes back to the new addressing, the embedded LC fragments in
-bursts B–E match, the slot-type/sync window (which carries the colour code) is
-untouched, and a stray private-call bit is forced clear.
-
-**`test_lanes`** — the concurrency model. Two calls interleaved across TS1 and
-TS2 are both captured in full; two streams arriving on one slot don't thrash it
-(first-come-wins); and the ingress gate rejects the wrong talkgroup, an unused
-slot, and private calls without opening a capture.
 
 ## Notes and limitations
 
